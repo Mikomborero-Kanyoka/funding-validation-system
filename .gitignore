@@ -1,5 +1,6 @@
 .zencoder/
 .zenflow/
+node_modules/
 __pycache__/
 *.pyc
 *.pyo
