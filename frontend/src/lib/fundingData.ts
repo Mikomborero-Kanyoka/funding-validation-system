@@ -262,6 +262,19 @@ function normalizeName(name: unknown) {
   return String(normalized).toUpperCase().split(/\s+/).filter(Boolean).join(' ');
 }
 
+function normalizeAmount(value: unknown) {
+  const normalized = normalizeScalar(value);
+  if (normalized === null) return null;
+  if (typeof normalized === 'number') return Number.isFinite(normalized) ? normalized : null;
+  if (typeof normalized !== 'string') return null;
+
+  const sanitized = normalized.replace(/,/g, '').trim();
+  if (!sanitized) return null;
+
+  const parsed = Number(sanitized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function longestCommonSubstring(left: string, right: string) {
   const rows = Array.from({ length: left.length + 1 }, () => Array(right.length + 1).fill(0));
   let longest = 0;
@@ -403,7 +416,7 @@ function buildApplicationRecord(row: SourceRow, index: number) {
     applicant_name: getFirstPresent(row, 'CUSTOMER_NAME1', 'CUSTOMER NAME1', 'CUSTOMER NAME', 'FULL NAME', 'NAME', 'APPLICANT NAME', 'CLIENT NAME', 'BORROWER NAME') as string | null,
     ec_number: getFirstPresent(row, 'EC_NUMBER', 'EC NUMBER', 'EC NO', 'EC', 'ECONOMIC CENTER', 'ECONOMIC CENTRE', 'BRANCH CODE', 'BRANCH') as string | number | null,
     customer_no: getFirstPresent(row, 'CUSTOMER_NO', 'CUSTOMER NO', 'ID', 'ID NUMBER', 'CUSTOMER ID', 'CLIENT ID', 'ACCOUNT NUMBER', 'ACCOUNT NO', 'ACCOUNT') as string | number | null,
-    amount: getFirstPresent(row, 'AMOUNT_FINANCED', 'AMOUNT FINANCED', 'AMOUNT', 'LOAN AMOUNT', 'FINANCE AMOUNT', 'CREDIT AMOUNT', 'VALUE') as number | string | null,
+    amount: normalizeAmount(getFirstPresent(row, 'AMOUNT_FINANCED', 'AMOUNT FINANCED', 'AMOUNT', 'LOAN AMOUNT', 'FINANCE AMOUNT', 'CREDIT AMOUNT', 'VALUE')),
     application_book_date: applicationBookDate?.toISOString() ?? null,
     decision_status: 'pending' as const,
   };
@@ -571,7 +584,7 @@ function buildCsvResponseRecord(row: SourceRow, index: number) {
     applicant_name: getFirstPresent(row, 'BeneficiaryName', 'BENEFICIARY NAME', 'NAME', 'APPLICANT NAME') as string | null,
     ec_number: getFirstPresent(row, 'Reference', 'REFERENCE', 'REF', 'ID') as string | number | null,
     customer_no: getFirstPresent(row, 'Reference', 'REFERENCE', 'REF', 'ID') as string | number | null,
-    amount: getFirstPresent(row, 'Amount', 'AMOUNT', 'AMOUNT_FINANCED', 'LOAN AMOUNT') as number | string | null,
+    amount: normalizeAmount(getFirstPresent(row, 'Amount', 'AMOUNT', 'AMOUNT_FINANCED', 'LOAN AMOUNT')),
     application_book_date: null,
     category: 'clear' as const,
     reason: initialStatus !== null ? `CSV response: ${String(responseStatus ?? '')}.` : 'CSV response pending review.',
@@ -901,7 +914,7 @@ async function syncSummaryCounts(sessionId: string) {
   return summary;
 }
 
-async function fetchSessionRecordRow(sessionId: string, applicationId: string) {
+async function fetchSessionRecordRow(sessionId: string, applicationId: string): Promise<ReviewRecordRow> {
   const data = await runQuery(
     supabase
       .from('review_records')
@@ -911,10 +924,11 @@ async function fetchSessionRecordRow(sessionId: string, applicationId: string) {
       .single(),
     'Failed to load the selected record.',
   );
+  if (!data) fail('Failed to load the selected record.');
   return data as ReviewRecordRow;
 }
 
-async function fetchSessionRow(sessionId: string) {
+async function fetchSessionRow(sessionId: string): Promise<ReviewSessionRow> {
   const data = await runQuery(
     supabase
       .from('review_sessions')
@@ -923,6 +937,7 @@ async function fetchSessionRow(sessionId: string) {
       .single(),
     'Failed to load the review session.',
   );
+  if (!data) fail('Failed to load the review session.');
   return data as ReviewSessionRow;
 }
 

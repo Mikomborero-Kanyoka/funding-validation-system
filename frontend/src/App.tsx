@@ -1,4 +1,5 @@
-import { useEffect, useState, Dispatch, SetStateAction } from 'react';
+import { useEffect, useState } from 'react';
+import type { Dispatch, SetStateAction } from 'react';
 import {
   AlertTriangle,
   ChevronDown,
@@ -78,11 +79,6 @@ type DecisionSummary = {
   approved_count: number;
   rejected_count: number;
   pending_count: number;
-};
-
-type DecisionResponse = {
-  record: ReviewRecord;
-  summary: DecisionSummary;
 };
 
 type ActivityEvent = {
@@ -1691,6 +1687,7 @@ function ApprovalLedgerView() {
 }
 
 export default function App() {
+  void ExportView;
   const [view, setView] = useState<View>('upload');
   const [results, setResults] = useState<AnalysisResponse | null>(null);
 
