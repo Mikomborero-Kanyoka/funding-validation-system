@@ -1,0 +1,13 @@
+.zencoder/
+.zenflow/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+frontend/.env
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/build.log
