@@ -1103,7 +1103,7 @@ function formatReportFieldLabel(label: string) {
     .replace(/\b\w/g, character => character.toUpperCase());
 }
 
-function formatReportValue(value: JsonValue | undefined) {
+function formatReportValue(value: JsonValue | undefined): string {
   if (value === null || value === undefined || value === '') return 'N/A';
   if (Array.isArray(value)) {
     const parts = value.map(item => formatReportValue(item)).filter(item => item !== 'N/A');
