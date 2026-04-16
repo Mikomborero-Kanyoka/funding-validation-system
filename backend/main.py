@@ -316,6 +316,40 @@ def normalize_name(name):
         return ""
     return " ".join(str(name).upper().split())
 
+def normalize_display_text(value):
+    value = normalize_scalar(value)
+    if value is None:
+        return None
+    return str(value).strip() or None
+
+def unique_display_names(values):
+    seen = set()
+    result = []
+
+    for value in values:
+        normalized = normalize_name(value)
+        display = normalize_display_text(value)
+        if not normalized or not display or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(display)
+
+    return result
+
+def join_display_names(names):
+    if not names:
+        return "multiple people"
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    if len(names) == 3:
+        return f"{names[0]}, {names[1]}, and {names[2]}"
+    return f"{names[0]}, {names[1]}, {names[2]}, and {len(names) - 3} others"
+
+def build_possible_fraud_reason(identifier_label, names):
+    return f"{identifier_label} used by {join_display_names(names)} possible fraud"
+
 def names_are_similar(name1, name2, threshold=0.75):
     """Check if two names are similar (likely the same person with minor variations)."""
     n1 = normalize_name(name1)
@@ -489,6 +523,19 @@ def get_first_present(row: pd.Series, *candidate_names: str):
             return value
 
     return None
+
+
+def extract_currency(row: pd.Series):
+    currency = get_first_present(
+        row,
+        "CURRENCY",
+        "CCY",
+        "CUR",
+        "CURRENCY CODE",
+        "CURRENCY_CODE",
+    )
+    normalized = normalize_display_text(currency)
+    return normalized.upper() if normalized else None
 
 
 def to_excel_cell(value):
@@ -837,6 +884,7 @@ def build_application_record(row: pd.Series, index: int):
         "ec_number": ec_number,
         "customer_no": customer_no,
         "amount": amount,
+        "currency": extract_currency(row),
         "application_book_date": application_book_date.isoformat() if application_book_date else None,
         "decision_status": "pending",
     }
@@ -883,6 +931,14 @@ def analyze_application(
     else:
         matched_records = history_df.iloc[0:0].copy()
 
+    if "_ec_key" not in matched_records.columns:
+        matched_records = matched_records.copy()
+        matched_records["_ec_key"] = matched_records["EC_NUMBER"].map(normalize_identifier)
+    if "_customer_key" not in matched_records.columns:
+        if matched_records is history_df:
+            matched_records = matched_records.copy()
+        matched_records["_customer_key"] = matched_records["CUSTOMER_NO"].map(normalize_identifier)
+
     recent_matches = matched_records[
         matched_records["BOOK_DATE"].notna() &
         matched_records["BOOK_DATE"].between(review_window_start, reference_date)
@@ -898,74 +954,45 @@ def analyze_application(
 
     if not recent_matches.empty:
         anomaly_reasons.append(
-            f"Previous loan found within the last {RECENT_APPLICATION_WINDOW_DAYS} days."
+            f"Previous loan found within the last {RECENT_APPLICATION_WINDOW_DAYS} days"
         )
 
-    # Check for identity fraud: same EC number or account number used by different or similar names
+    # Check for identifier reuse across different names.
     if not matched_records.empty:
-        current_name = normalize_name(application["applicant_name"])
+        current_display_name = normalize_display_text(application["applicant_name"])
         app_ec_key = normalize_identifier(application["ec_number"])
         app_customer_key = normalize_identifier(application["customer_no"])
 
-        # Check EC number groups for multiple identities
-        # Use the normalized key for grouping to ensure consistent results (e.g. '0410' == '410')
+        # Check EC number groups for multiple identities.
         ec_groups = matched_records.groupby("_ec_key")
         for ec_key, group in ec_groups:
             if ec_key:
-                # Get the original EC number for the message from the first record in the group
-                orig_ec = group["EC_NUMBER"].iloc[0]
-                
-                historical_names = [normalize_name(n) for n in group["CUSTOMER_NAME1"].dropna().unique()]
-                all_names_for_ec = list(set(historical_names))
-                
-                # Only include current application name if it is actually using this EC number
-                if app_ec_key == ec_key:
-                    if current_name not in all_names_for_ec:
-                        all_names_for_ec.append(current_name)
-                
-                if len(all_names_for_ec) > 1:
-                    # First check if names are similar (potential fraud)
-                    if detect_similar_names(all_names_for_ec):
-                        anomaly_reasons.append(
-                            f"Potential identity fraud: EC number '{orig_ec}' used by similar names (possible typos/variations)."
-                        )
-                        break  # Only flag once per application
-                    else:
-                        # Names are completely different (confirmed fraud)
-                        anomaly_reasons.append(
-                            f"Identity fraud detected: EC number '{orig_ec}' used by {len(all_names_for_ec)} different names."
-                        )
-                        break  # Only flag once per application
+                all_names_for_ec = unique_display_names(
+                    list(group["CUSTOMER_NAME1"].dropna().tolist()) +
+                    ([current_display_name] if app_ec_key == ec_key and current_display_name else [])
+                )
 
-        # Check customer number groups for multiple identities
-        if not any("Identity fraud detected" in reason or "Potential identity fraud" in reason for reason in anomaly_reasons):
+                if len(all_names_for_ec) > 1:
+                    anomaly_reasons.append(
+                        build_possible_fraud_reason("EC number", all_names_for_ec)
+                    )
+                    break
+
+        # Check customer number groups for multiple identities.
+        if not any(reason.endswith("possible fraud") for reason in anomaly_reasons):
             customer_groups = matched_records.groupby("_customer_key")
             for customer_key, group in customer_groups:
                 if customer_key:
-                    # Get the original customer number for the message
-                    orig_customer = group["CUSTOMER_NO"].iloc[0]
-                    
-                    historical_names = [normalize_name(n) for n in group["CUSTOMER_NAME1"].dropna().unique()]
-                    all_names_for_customer = list(set(historical_names))
-                    
-                    # Only include current application name if it is actually using this customer number
-                    if app_customer_key == customer_key:
-                        if current_name not in all_names_for_customer:
-                            all_names_for_customer.append(current_name)
-                    
+                    all_names_for_customer = unique_display_names(
+                        list(group["CUSTOMER_NAME1"].dropna().tolist()) +
+                        ([current_display_name] if app_customer_key == customer_key and current_display_name else [])
+                    )
+
                     if len(all_names_for_customer) > 1:
-                        # First check if names are similar (potential fraud)
-                        if detect_similar_names(all_names_for_customer):
-                            anomaly_reasons.append(
-                                f"Potential identity fraud: Account number '{orig_customer}' used by similar names (possible typos/variations)."
-                            )
-                            break  # Only flag once per application
-                        else:
-                            # Names are completely different (confirmed fraud)
-                            anomaly_reasons.append(
-                                f"Identity fraud detected: Account number '{orig_customer}' used by {len(all_names_for_customer)} different names."
-                            )
-                            break  # Only flag once per application
+                        anomaly_reasons.append(
+                            build_possible_fraud_reason("Account number", all_names_for_customer)
+                        )
+                        break
 
     is_anomaly = len(anomaly_reasons) > 0
 
@@ -1044,6 +1071,7 @@ def build_csv_response_record(row: pd.Series, index: int) -> dict:
         "ec_number": reference,
         "customer_no": reference,
         "amount": normalize_scalar(amount),
+        "currency": extract_currency(row),
         "application_book_date": None,
         "decision_status": initial_status or "pending",
         "response_status": normalize_scalar(response_status),

@@ -112,7 +112,7 @@ print(f"Category: {result2['category']}")
 print(f"Anomaly Reasons: {result2['anomaly_reasons']}")
 print(f"Main Reason: {result2['reason']}")
 assert result2['category'] == 'anomaly', "Should be flagged as anomaly"
-assert any("Multiple identities detected" in reason for reason in result2['anomaly_reasons']), "Should detect name mismatch"
+assert any("possible fraud" in reason for reason in result2['anomaly_reasons']), "Should detect name mismatch"
 print("PASSED\n")
 
 # Test Case 3: No anomalies - should be clear

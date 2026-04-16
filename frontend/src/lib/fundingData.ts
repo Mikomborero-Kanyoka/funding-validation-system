@@ -15,6 +15,7 @@ type SearchRecord = {
   EC_NUMBER?: string | null;
   CUSTOMER_NO?: string | number | null;
   AMOUNT_FINANCED?: number | null;
+  CURRENCY?: string | null;
   BOOK_DATE?: string | null;
 };
 
@@ -27,6 +28,7 @@ type ReviewRecord = {
   ec_number?: string | number | null;
   customer_no?: string | number | null;
   amount?: number | null;
+  currency?: string | null;
   application_book_date?: string | null;
   category: 'anomaly' | 'clear';
   reason: string;
@@ -222,6 +224,7 @@ type ParsedUpload = {
 const RECENT_APPLICATION_WINDOW_DAYS = 14;
 const HISTORY_FETCH_CHUNK = 250;
 const sessionSourceRowCache = new Map<string, Record<string, SourceRow>>();
+const CSV_RESPONSE_REPORT_RECIPIENT = 'aiqkanyoka@gmail.com';
 
 function fail(message: string): never {
   throw new Error(message);
@@ -273,69 +276,6 @@ function normalizeAmount(value: unknown) {
 
   const parsed = Number(sanitized);
   return Number.isFinite(parsed) ? parsed : null;
-}
-
-function longestCommonSubstring(left: string, right: string) {
-  const rows = Array.from({ length: left.length + 1 }, () => Array(right.length + 1).fill(0));
-  let longest = 0;
-  for (let i = 1; i <= left.length; i += 1) {
-    for (let j = 1; j <= right.length; j += 1) {
-      if (left[i - 1] === right[j - 1]) {
-        rows[i][j] = rows[i - 1][j - 1] + 1;
-        longest = Math.max(longest, rows[i][j]);
-      }
-    }
-  }
-  return longest;
-}
-
-function editDistance(left: string, right: string) {
-  const rows = Array.from({ length: left.length + 1 }, () => Array(right.length + 1).fill(0));
-  for (let i = 0; i <= left.length; i += 1) rows[i][0] = i;
-  for (let j = 0; j <= right.length; j += 1) rows[0][j] = j;
-
-  for (let i = 1; i <= left.length; i += 1) {
-    for (let j = 1; j <= right.length; j += 1) {
-      const cost = left[i - 1] === right[j - 1] ? 0 : 1;
-      rows[i][j] = Math.min(rows[i - 1][j] + 1, rows[i][j - 1] + 1, rows[i - 1][j - 1] + cost);
-    }
-  }
-  return rows[left.length][right.length];
-}
-
-function namesAreSimilar(leftName: unknown, rightName: unknown, threshold = 0.75) {
-  const left = normalizeName(leftName);
-  const right = normalizeName(rightName);
-  if (left === right) return true;
-  if (!left || !right) return false;
-
-  const leftWords = new Set(left.split(' '));
-  const rightWords = new Set(right.split(' '));
-  const leftSubset = [...leftWords].every(word => rightWords.has(word));
-  const rightSubset = [...rightWords].every(word => leftWords.has(word));
-  if (leftSubset || rightSubset) return true;
-
-  const overlap = [...leftWords].filter(word => rightWords.has(word)).length;
-  const shorterWords = Math.min(leftWords.size, rightWords.size);
-  if (shorterWords > 0 && overlap / shorterWords >= 0.6) return true;
-
-  const shorter = left.length <= right.length ? left : right;
-  const longer = left.length > right.length ? left : right;
-  if (longer.length - shorter.length > Math.max(2, shorter.length * 0.2)) return false;
-
-  const lcsSimilarity = longestCommonSubstring(left, right) / shorter.length;
-  const editSimilarity = 1 - (editDistance(left, right) / Math.max(left.length, right.length));
-  return Math.max(lcsSimilarity, editSimilarity) >= threshold;
-}
-
-function detectSimilarNames(names: string[]) {
-  const filtered = names.filter(Boolean);
-  for (let i = 0; i < filtered.length; i += 1) {
-    for (let j = i + 1; j < filtered.length; j += 1) {
-      if (namesAreSimilar(filtered[i], filtered[j])) return true;
-    }
-  }
-  return false;
 }
 
 function excelSerialToDate(value: number) {
@@ -396,6 +336,52 @@ function uniqueStrings(values: (string | null | undefined)[]) {
   return [...new Set(values.filter((value): value is string => Boolean(value)))];
 }
 
+function normalizeDisplayText(value: unknown) {
+  const normalized = normalizeScalar(value);
+  if (normalized === null || normalized instanceof Date) return null;
+  const text = String(normalized).trim();
+  return text || null;
+}
+
+function normalizeCurrency(value: unknown) {
+  const currency = normalizeDisplayText(value);
+  return currency ? currency.toUpperCase() : null;
+}
+
+function extractCurrency(row: SourceRow | Record<string, unknown> | null | undefined) {
+  if (!row) return null;
+  return normalizeCurrency(
+    getFirstPresent(row as SourceRow, 'CURRENCY', 'CCY', 'CUR', 'CURRENCY CODE', 'CURRENCY_CODE'),
+  );
+}
+
+function uniqueDisplayNames(values: unknown[]) {
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  values.forEach(value => {
+    const normalized = normalizeName(value);
+    const display = normalizeDisplayText(value);
+    if (!normalized || !display || seen.has(normalized)) return;
+    seen.add(normalized);
+    result.push(display);
+  });
+
+  return result;
+}
+
+function joinNames(names: string[]) {
+  if (names.length === 0) return 'multiple people';
+  if (names.length === 1) return names[0];
+  if (names.length === 2) return `${names[0]} and ${names[1]}`;
+  if (names.length === 3) return `${names[0]}, ${names[1]}, and ${names[2]}`;
+  return `${names[0]}, ${names[1]}, ${names[2]}, and ${names.length - 3} others`;
+}
+
+function buildPossibleFraudReason(identifierLabel: 'EC number' | 'Account number', names: string[]) {
+  return `${identifierLabel} used by ${joinNames(names)} possible fraud`;
+}
+
 function buildApplicationRecord(row: SourceRow, index: number) {
   const applicationBookDate = parseDate(
     getFirstPresent(
@@ -417,6 +403,7 @@ function buildApplicationRecord(row: SourceRow, index: number) {
     ec_number: getFirstPresent(row, 'EC_NUMBER', 'EC NUMBER', 'EC NO', 'EC', 'ECONOMIC CENTER', 'ECONOMIC CENTRE', 'BRANCH CODE', 'BRANCH') as string | number | null,
     customer_no: getFirstPresent(row, 'CUSTOMER_NO', 'CUSTOMER NO', 'ID', 'ID NUMBER', 'CUSTOMER ID', 'CLIENT ID', 'ACCOUNT NUMBER', 'ACCOUNT NO', 'ACCOUNT') as string | number | null,
     amount: normalizeAmount(getFirstPresent(row, 'AMOUNT_FINANCED', 'AMOUNT FINANCED', 'AMOUNT', 'LOAN AMOUNT', 'FINANCE AMOUNT', 'CREDIT AMOUNT', 'VALUE')),
+    currency: extractCurrency(row),
     application_book_date: applicationBookDate?.toISOString() ?? null,
     decision_status: 'pending' as const,
   };
@@ -431,6 +418,7 @@ function toMatchDisplayRecord(row: HistoryRecordRow): ReviewMatchRecord {
     EC_NUMBER: (base.EC_NUMBER ?? row.ec_number ?? null) as string | null,
     CUSTOMER_NO: (base.CUSTOMER_NO ?? row.customer_no ?? null) as string | number | null,
     AMOUNT_FINANCED: (base.AMOUNT_FINANCED ?? row.amount_financed ?? null) as number | null,
+    CURRENCY: (base.CURRENCY ?? extractCurrency((row.row_data ?? {}) as SourceRow) ?? null) as string | null,
     BOOK_DATE: (base.BOOK_DATE ?? row.book_date ?? null) as string | null,
   };
 }
@@ -491,10 +479,10 @@ function analyzeApplication(row: SourceRow, index: number, historyRows: Prepared
   const recentMatches = matchedRows.filter(historyRow => historyRow.bookDate !== null && historyRow.bookDate >= reviewWindowStart && historyRow.bookDate <= referenceDate);
   const latestBookDate = matchedRows.find(historyRow => historyRow.bookDate)?.bookDate ?? null;
 
-  if (recentMatches.length > 0) anomalyReasons.push(`Previous loan found within the last ${RECENT_APPLICATION_WINDOW_DAYS} days.`);
+  if (recentMatches.length > 0) anomalyReasons.push(`Previous loan found within the last ${RECENT_APPLICATION_WINDOW_DAYS} days`);
 
   if (matchedRows.length > 0) {
-    const currentName = normalizeName(application.applicant_name);
+    const currentApplicantName = normalizeDisplayText(application.applicant_name);
     const appEcKey = normalizeIdentifier(application.ec_number);
     const appCustomerKey = normalizeIdentifier(application.customer_no);
 
@@ -507,20 +495,17 @@ function analyzeApplication(row: SourceRow, index: number, historyRows: Prepared
     });
 
     for (const [ecKey, group] of ecGroups.entries()) {
-      const originalEc = group[0]?.ecNumber;
-      const allNames = [...uniqueStrings(group.map(item => normalizeName(item.customerName1)))];
-      if (appEcKey === ecKey && currentName && !allNames.includes(currentName)) allNames.push(currentName);
+      const allNames = uniqueDisplayNames([
+        ...group.map(item => item.customerName1),
+        ...(appEcKey === ecKey && currentApplicantName ? [currentApplicantName] : []),
+      ]);
       if (allNames.length > 1) {
-        anomalyReasons.push(
-          detectSimilarNames(allNames)
-            ? `Potential identity fraud: EC number '${originalEc}' used by similar names (possible typos/variations).`
-            : `Identity fraud detected: EC number '${originalEc}' used by ${allNames.length} different names.`,
-        );
+        anomalyReasons.push(buildPossibleFraudReason('EC number', allNames));
         break;
       }
     }
 
-    if (!anomalyReasons.some(reason => reason.includes('Identity fraud detected') || reason.includes('Potential identity fraud'))) {
+    if (!anomalyReasons.some(reason => reason.endsWith('possible fraud'))) {
       const customerGroups = new Map<string, PreparedHistoryRow[]>();
       matchedRows.forEach(historyRow => {
         if (!historyRow.customerKey) return;
@@ -530,15 +515,12 @@ function analyzeApplication(row: SourceRow, index: number, historyRows: Prepared
       });
 
       for (const [customerKey, group] of customerGroups.entries()) {
-        const originalCustomer = group[0]?.customerNo;
-        const allNames = [...uniqueStrings(group.map(item => normalizeName(item.customerName1)))];
-        if (appCustomerKey === customerKey && currentName && !allNames.includes(currentName)) allNames.push(currentName);
+        const allNames = uniqueDisplayNames([
+          ...group.map(item => item.customerName1),
+          ...(appCustomerKey === customerKey && currentApplicantName ? [currentApplicantName] : []),
+        ]);
         if (allNames.length > 1) {
-          anomalyReasons.push(
-            detectSimilarNames(allNames)
-              ? `Potential identity fraud: Account number '${originalCustomer}' used by similar names (possible typos/variations).`
-              : `Identity fraud detected: Account number '${originalCustomer}' used by ${allNames.length} different names.`,
-          );
+          anomalyReasons.push(buildPossibleFraudReason('Account number', allNames));
           break;
         }
       }
@@ -585,6 +567,7 @@ function buildCsvResponseRecord(row: SourceRow, index: number) {
     ec_number: getFirstPresent(row, 'Reference', 'REFERENCE', 'REF', 'ID') as string | number | null,
     customer_no: getFirstPresent(row, 'Reference', 'REFERENCE', 'REF', 'ID') as string | number | null,
     amount: normalizeAmount(getFirstPresent(row, 'Amount', 'AMOUNT', 'AMOUNT_FINANCED', 'LOAN AMOUNT')),
+    currency: extractCurrency(row),
     application_book_date: null,
     category: 'clear' as const,
     reason: initialStatus !== null ? `CSV response: ${String(responseStatus ?? '')}.` : 'CSV response pending review.',
@@ -668,6 +651,7 @@ function mapReviewRecordRow(row: ReviewRecordRow): ReviewRecord {
     ec_number: row.ec_number,
     customer_no: row.customer_no,
     amount: row.amount,
+    currency: extractCurrency(row.source_row),
     application_book_date: row.application_book_date,
     category: row.category,
     reason: row.reason,
@@ -1080,22 +1064,538 @@ function buildSheetBlob(rows: SourceRow[], bookType: 'xlsx' | 'csv') {
   return new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
 }
 
-export async function downloadSessionResults(results: AnalysisResponse) {
-  let rowsById = sessionSourceRowCache.get(results.session_id);
-  if (!rowsById) {
-    const recordRows = await runQuery(
-      supabase.from('review_records').select('application_id, source_row').eq('session_id', results.session_id),
-      'Failed to load downloadable rows for the current session.',
-    );
-    rowsById = Object.fromEntries(
-      (recordRows ?? []).map(row => [
-        (row as { application_id: string }).application_id,
-        ((row as { source_row: SourceRow | null }).source_row ?? {}) as SourceRow,
-      ]),
-    );
-    sessionSourceRowCache.set(results.session_id, rowsById);
+async function loadSessionSourceRows(sessionId: string) {
+  let rowsById = sessionSourceRowCache.get(sessionId);
+  if (rowsById) return rowsById;
+
+  const recordRows = await runQuery(
+    supabase.from('review_records').select('application_id, source_row').eq('session_id', sessionId),
+    'Failed to load downloadable rows for the current session.',
+  );
+  rowsById = Object.fromEntries(
+    (recordRows ?? []).map(row => [
+      (row as { application_id: string }).application_id,
+      ((row as { source_row: SourceRow | null }).source_row ?? {}) as SourceRow,
+    ]),
+  );
+  sessionSourceRowCache.set(sessionId, rowsById);
+  return rowsById;
+}
+
+function formatReportDateTime(value: string | Date) {
+  const parsed = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(parsed.getTime())) return String(value);
+  return new Intl.DateTimeFormat('en-US', {
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(parsed);
+}
+
+function formatReportFieldLabel(label: string) {
+  return label
+    .replace(/[_-]+/g, ' ')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, character => character.toUpperCase());
+}
+
+function formatReportValue(value: JsonValue | undefined) {
+  if (value === null || value === undefined || value === '') return 'N/A';
+  if (Array.isArray(value)) {
+    const parts = value.map(item => formatReportValue(item)).filter(item => item !== 'N/A');
+    return parts.length > 0 ? parts.join(', ') : 'N/A';
+  }
+  if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
+
+function formatReportCurrency(value: number | null | undefined, currency?: string | null) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return 'N/A';
+  const amount = new Intl.NumberFormat('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(value);
+  const code = normalizeCurrency(currency);
+  return code ? `${code} ${amount}` : amount;
+}
+
+function formatDecisionStatus(status: DecisionStatus) {
+  if (status === 'manual_review') return 'Manual review';
+  return status.charAt(0).toUpperCase() + status.slice(1);
+}
+
+function getCsvRecordName(record: ReviewRecord, sourceRow: SourceRow) {
+  return normalizeDisplayText(record.applicant_name)
+    ?? normalizeDisplayText(getFirstPresent(sourceRow, 'BeneficiaryName', 'BENEFICIARY NAME', 'NAME', 'APPLICANT NAME'))
+    ?? `Row ${record.row}`;
+}
+
+function getCsvRecordReference(record: ReviewRecord, sourceRow: SourceRow) {
+  return normalizeDisplayText(record.ec_number)
+    ?? normalizeDisplayText(record.customer_no)
+    ?? normalizeDisplayText(getFirstPresent(sourceRow, 'Reference', 'REFERENCE', 'REF', 'ID'))
+    ?? 'N/A';
+}
+
+function getCsvRecordResponse(record: ReviewRecord, sourceRow: SourceRow) {
+  return normalizeDisplayText(record.response_status)
+    ?? normalizeDisplayText(getFirstPresent(sourceRow, 'BeneficiaryStatus', 'Status', 'STATUS', 'DECISION', 'RESULT', 'APPLICATION_STATUS'))
+    ?? record.reason;
+}
+
+function escapePdfText(value: string) {
+  return value
+    .normalize('NFKD')
+    .replace(/[^\x20-\x7E]/g, '?')
+    .replace(/\\/g, '\\\\')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)');
+}
+
+type PdfColor = [number, number, number];
+
+type CsvResponseReportField = {
+  label: string;
+  value: string;
+};
+
+type CsvResponseRejectedRecord = {
+  title: string;
+  reference: string;
+  amount: string;
+  response: string;
+  reviewStatus: string;
+  fields: CsvResponseReportField[];
+};
+
+type CsvResponseReportData = {
+  title: string;
+  subtitle: string;
+  sourceFileName: string;
+  generatedAtLabel: string;
+  acceptedCount: number;
+  rejectedCount: number;
+  rejectedRecords: CsvResponseRejectedRecord[];
+};
+
+function wrapPdfText(text: string, maxChars: number) {
+  if (!text) return [''];
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length === 0) return [''];
+
+  const wrapped: string[] = [];
+  let current = words.shift() ?? '';
+
+  words.forEach(word => {
+    const next = `${current} ${word}`;
+    if (next.length <= maxChars) {
+      current = next;
+      return;
+    }
+    wrapped.push(current);
+    current = word;
+  });
+
+  wrapped.push(current);
+  return wrapped;
+}
+
+function pdfColor([red, green, blue]: PdfColor) {
+  return `${(red / 255).toFixed(3)} ${(green / 255).toFixed(3)} ${(blue / 255).toFixed(3)}`;
+}
+
+function buildStyledCsvReportPdf(report: CsvResponseReportData) {
+  const pageWidth = 612;
+  const pageHeight = 792;
+  const marginX = 36;
+  const topMargin = 28;
+  const bottomMargin = 28;
+  const headerHeight = 78;
+  const firstPageContentTop = pageHeight - topMargin - headerHeight - 20;
+  const continuedPageTop = pageHeight - topMargin - 30;
+  const contentWidth = pageWidth - marginX * 2;
+
+  const colors = {
+    header: [15, 23, 42] as PdfColor,
+    headerAccent: [14, 165, 233] as PdfColor,
+    text: [30, 41, 59] as PdfColor,
+    muted: [100, 116, 139] as PdfColor,
+    light: [241, 245, 249] as PdfColor,
+    border: [203, 213, 225] as PdfColor,
+    card: [248, 250, 252] as PdfColor,
+    accepted: [16, 185, 129] as PdfColor,
+    rejected: [244, 63, 94] as PdfColor,
+    section: [217, 119, 6] as PdfColor,
+    white: [255, 255, 255] as PdfColor,
+  };
+
+  type PdfPage = { commands: string[]; cursorTop: number; number: number };
+  const pages: PdfPage[] = [];
+
+  function startPage(firstPage: boolean) {
+    const pageNumber = pages.length + 1;
+    const page: PdfPage = { commands: [], cursorTop: firstPage ? firstPageContentTop : continuedPageTop, number: pageNumber };
+
+    if (firstPage) {
+      const headerTop = pageHeight - topMargin;
+      const headerBottom = headerTop - headerHeight;
+      page.commands.push(`${pdfColor(colors.header)} rg`);
+      page.commands.push(`${marginX} ${headerBottom} ${contentWidth} ${headerHeight} re f`);
+      page.commands.push(`${pdfColor(colors.headerAccent)} rg`);
+      page.commands.push(`${marginX} ${headerBottom} ${contentWidth} 8 re f`);
+
+      page.commands.push(
+        'BT',
+        `/F2 24 Tf`,
+        `${pdfColor(colors.white)} rg`,
+        `1 0 0 1 ${marginX + 20} ${headerTop - 34} Tm`,
+        `(${escapePdfText(report.title)}) Tj`,
+        'ET',
+      );
+      page.commands.push(
+        'BT',
+        `/F1 10 Tf`,
+        `${pdfColor(colors.white)} rg`,
+        `1 0 0 1 ${marginX + 20} ${headerTop - 52} Tm`,
+        `(${escapePdfText(report.subtitle)}) Tj`,
+        'ET',
+      );
+    } else {
+      page.commands.push(
+        'BT',
+        `/F2 13 Tf`,
+        `${pdfColor(colors.text)} rg`,
+        `1 0 0 1 ${marginX} ${pageHeight - topMargin - 6} Tm`,
+        `(${escapePdfText(`${report.title} - Continued`)}) Tj`,
+        'ET',
+      );
+      page.commands.push(`${pdfColor(colors.border)} RG`);
+      page.commands.push(`${marginX} ${pageHeight - topMargin - 16} m ${pageWidth - marginX} ${pageHeight - topMargin - 16} l S`);
+    }
+
+    pages.push(page);
+    return page;
   }
 
+  let page = startPage(true);
+
+  function ensureSpace(height: number) {
+    if (page.cursorTop - height < bottomMargin) {
+      page = startPage(false);
+    }
+  }
+
+  function drawTextBlock(
+    x: number,
+    top: number,
+    text: string,
+    options: { font: 'F1' | 'F2'; size: number; color: PdfColor; maxChars?: number; lineHeight?: number },
+  ) {
+    const lineHeight = options.lineHeight ?? Math.max(12, options.size + 2);
+    const lines = wrapPdfText(text, options.maxChars ?? 60);
+    lines.forEach((line, index) => {
+      page.commands.push(
+        'BT',
+        `/${options.font} ${options.size} Tf`,
+        `${pdfColor(options.color)} rg`,
+        `1 0 0 1 ${x} ${top - options.size - index * lineHeight} Tm`,
+        `(${escapePdfText(line)}) Tj`,
+        'ET',
+      );
+    });
+    return lines.length * lineHeight;
+  }
+
+  function drawInfoCard(x: number, width: number, label: string, value: string, height: number) {
+    const top = page.cursorTop;
+    page.commands.push(`${pdfColor(colors.light)} rg`);
+    page.commands.push(`${pdfColor(colors.border)} RG`);
+    page.commands.push(`${x} ${top - height} ${width} ${height} re B`);
+    drawTextBlock(x + 12, top - 12, label, { font: 'F2', size: 9, color: colors.muted, maxChars: 20, lineHeight: 11 });
+    drawTextBlock(x + 12, top - 28, value, { font: 'F1', size: 10, color: colors.text, maxChars: Math.max(24, Math.floor((width - 24) / 5.4)), lineHeight: 12 });
+  }
+
+  function drawStatCard(x: number, width: number, label: string, value: string, accent: PdfColor, height: number) {
+    const top = page.cursorTop;
+    page.commands.push(`${pdfColor(colors.card)} rg`);
+    page.commands.push(`${pdfColor(colors.border)} RG`);
+    page.commands.push(`${x} ${top - height} ${width} ${height} re B`);
+    page.commands.push(`${pdfColor(accent)} rg`);
+    page.commands.push(`${x} ${top - height} ${width} 6 re f`);
+    drawTextBlock(x + 12, top - 16, label, { font: 'F2', size: 9, color: colors.muted, maxChars: 18, lineHeight: 11 });
+    drawTextBlock(x + 12, top - 34, value, { font: 'F2', size: 18, color: colors.text, maxChars: 12, lineHeight: 18 });
+  }
+
+  function drawSectionTitle(title: string) {
+    const height = 28;
+    ensureSpace(height + 10);
+    const top = page.cursorTop;
+    page.commands.push(`${pdfColor(colors.section)} rg`);
+    page.commands.push(`${marginX} ${top - height} ${contentWidth} ${height} re f`);
+    drawTextBlock(marginX + 14, top - 7, title, { font: 'F2', size: 12, color: colors.white, maxChars: 50, lineHeight: 13 });
+    page.cursorTop -= height + 14;
+  }
+
+  function estimateRecordHeight(record: CsvResponseRejectedRecord) {
+    const topLines =
+      wrapPdfText(record.title, 60).length +
+      wrapPdfText(`Reference: ${record.reference}`, 70).length +
+      wrapPdfText(`Amount: ${record.amount}`, 70).length +
+      wrapPdfText(`Response: ${record.response}`, 70).length +
+      wrapPdfText(`Review status: ${record.reviewStatus}`, 70).length;
+    const fieldLines = record.fields.reduce((count, field) => count + wrapPdfText(`${field.label}: ${field.value}`, 72).length, 0);
+    return 34 + topLines * 13 + (record.fields.length > 0 ? 18 + fieldLines * 11 : 0) + 18;
+  }
+
+  function drawRejectedRecord(record: CsvResponseRejectedRecord, index: number) {
+    const height = estimateRecordHeight(record);
+    ensureSpace(height);
+    const top = page.cursorTop;
+
+    page.commands.push(`${pdfColor(colors.card)} rg`);
+    page.commands.push(`${pdfColor(colors.border)} RG`);
+    page.commands.push(`${marginX} ${top - height} ${contentWidth} ${height} re B`);
+    page.commands.push(`${pdfColor(colors.rejected)} rg`);
+    page.commands.push(`${marginX} ${top - 26} ${contentWidth} 26 re f`);
+
+    drawTextBlock(marginX + 14, top - 7, `${index + 1}. ${record.title}`, {
+      font: 'F2',
+      size: 12,
+      color: colors.white,
+      maxChars: 62,
+      lineHeight: 13,
+    });
+
+    let contentTop = top - 40;
+    const leftX = marginX + 14;
+    contentTop -= drawTextBlock(leftX, contentTop, `Reference: ${record.reference}`, {
+      font: 'F1',
+      size: 10,
+      color: colors.text,
+      maxChars: 72,
+      lineHeight: 12,
+    }) + 2;
+    contentTop -= drawTextBlock(leftX, contentTop, `Amount: ${record.amount}`, {
+      font: 'F1',
+      size: 10,
+      color: colors.text,
+      maxChars: 72,
+      lineHeight: 12,
+    }) + 2;
+    contentTop -= drawTextBlock(leftX, contentTop, `Response: ${record.response}`, {
+      font: 'F1',
+      size: 10,
+      color: colors.text,
+      maxChars: 72,
+      lineHeight: 12,
+    }) + 2;
+    contentTop -= drawTextBlock(leftX, contentTop, `Review status: ${record.reviewStatus}`, {
+      font: 'F1',
+      size: 10,
+      color: colors.text,
+      maxChars: 72,
+      lineHeight: 12,
+    }) + 4;
+
+    if (record.fields.length > 0) {
+      contentTop -= drawTextBlock(leftX, contentTop, 'Uploaded fields', {
+        font: 'F2',
+        size: 10,
+        color: colors.muted,
+        maxChars: 30,
+        lineHeight: 11,
+      });
+
+      record.fields.forEach(field => {
+        contentTop -= drawTextBlock(leftX + 8, contentTop, `${field.label}: ${field.value}`, {
+          font: 'F1',
+          size: 9,
+          color: colors.text,
+          maxChars: 74,
+          lineHeight: 11,
+        }) + 1;
+      });
+    }
+
+    page.cursorTop -= height + 12;
+  }
+
+  ensureSpace(116);
+  drawInfoCard(marginX, contentWidth, 'Source file', report.sourceFileName, 54);
+  page.cursorTop -= 66;
+  drawInfoCard(marginX, contentWidth * 0.62 - 6, 'Generated', report.generatedAtLabel, 48);
+  drawStatCard(marginX + contentWidth * 0.62 + 6, contentWidth * 0.18 - 6, 'Accepted', String(report.acceptedCount), colors.accepted, 48);
+  drawStatCard(marginX + contentWidth * 0.80 + 12, contentWidth * 0.20 - 12, 'Rejected', String(report.rejectedCount), colors.rejected, 48);
+  page.cursorTop -= 62;
+
+  drawSectionTitle('Rejected Records');
+
+  if (report.rejectedRecords.length === 0) {
+    ensureSpace(60);
+    const top = page.cursorTop;
+    page.commands.push(`${pdfColor(colors.light)} rg`);
+    page.commands.push(`${pdfColor(colors.border)} RG`);
+    page.commands.push(`${marginX} ${top - 52} ${contentWidth} 52 re B`);
+    drawTextBlock(marginX + 14, top - 15, 'No rejected records were found in this CSV response batch.', {
+      font: 'F1',
+      size: 11,
+      color: colors.text,
+      maxChars: 72,
+      lineHeight: 13,
+    });
+    page.cursorTop -= 64;
+  } else {
+    report.rejectedRecords.forEach((record, index) => drawRejectedRecord(record, index));
+  }
+
+  pages.forEach(pdfPage => {
+    pdfPage.commands.push(
+      'BT',
+      `/F1 9 Tf`,
+      `${pdfColor(colors.muted)} rg`,
+      `1 0 0 1 ${pageWidth - marginX - 70} 18 Tm`,
+      `(${escapePdfText(`Page ${pdfPage.number}`)}) Tj`,
+      'ET',
+    );
+  });
+
+  const pageCount = pages.length;
+  const regularFontObjectId = 3 + pageCount * 2;
+  const boldFontObjectId = regularFontObjectId + 1;
+  const objects: string[] = new Array(boldFontObjectId);
+  const encoder = new TextEncoder();
+  const pageRefs: string[] = [];
+
+  objects[0] = '<< /Type /Catalog /Pages 2 0 R >>';
+
+  pages.forEach((pdfPage, pageIndex) => {
+    const pageObjectId = 3 + pageIndex * 2;
+    const contentObjectId = pageObjectId + 1;
+    const content = pdfPage.commands.join('\n');
+    pageRefs.push(`${pageObjectId} 0 R`);
+    objects[pageObjectId - 1] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Resources << /Font << /F1 ${regularFontObjectId} 0 R /F2 ${boldFontObjectId} 0 R >> >> /Contents ${contentObjectId} 0 R >>`;
+    objects[contentObjectId - 1] = `<< /Length ${encoder.encode(content).length} >>\nstream\n${content}\nendstream`;
+  });
+
+  objects[1] = `<< /Type /Pages /Kids [${pageRefs.join(' ')}] /Count ${pageCount} >>`;
+  objects[regularFontObjectId - 1] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
+  objects[boldFontObjectId - 1] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>';
+
+  let pdf = '%PDF-1.4\n';
+  const offsets = [0];
+
+  objects.forEach((object, index) => {
+    offsets[index + 1] = pdf.length;
+    pdf += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  });
+
+  const xrefOffset = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (let objectId = 1; objectId <= objects.length; objectId += 1) {
+    pdf += `${String(offsets[objectId]).padStart(10, '0')} 00000 n \n`;
+  }
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+
+  return new Blob([pdf], { type: 'application/pdf' });
+}
+
+async function buildCsvResponseReport(results: AnalysisResponse) {
+  if (results.analysis_mode !== 'csv') fail('PDF reports are only available for CSV response uploads.');
+
+  const rowsById = await loadSessionSourceRows(results.session_id);
+  const records = [...results.anomalies, ...results.clear_records].sort((left, right) => left.row - right.row);
+  const acceptedRecords = records.filter(record => record.decision_status === 'approved');
+  const rejectedRecords = records.filter(record => record.decision_status === 'declined');
+  const generatedAt = new Date();
+  const rejectedDetails: CsvResponseRejectedRecord[] = rejectedRecords.map(record => {
+    const sourceRow = rowsById[record.application_id] ?? {};
+    const fields = Object.entries(sourceRow)
+      .map(([key, value]) => ({
+        label: formatReportFieldLabel(key),
+        value: formatReportValue(value as JsonValue),
+      }))
+      .filter(field => field.value !== 'N/A');
+
+    return {
+      title: getCsvRecordName(record, sourceRow),
+      reference: getCsvRecordReference(record, sourceRow),
+      amount: formatReportCurrency(record.amount ?? null, record.currency ?? extractCurrency(sourceRow)),
+      response: getCsvRecordResponse(record, sourceRow),
+      reviewStatus: formatDecisionStatus(record.decision_status),
+      fields,
+    };
+  });
+
+  const pdfReport: CsvResponseReportData = {
+    title: 'CSV Response Report',
+    subtitle: 'Accepted total with detailed rejected records',
+    sourceFileName: results.file_name,
+    generatedAtLabel: formatReportDateTime(generatedAt),
+    acceptedCount: acceptedRecords.length,
+    rejectedCount: rejectedDetails.length,
+    rejectedRecords: rejectedDetails,
+  };
+
+  return {
+    blob: buildStyledCsvReportPdf(pdfReport),
+    fileName: `${results.file_name.replace(/\.[^.]+$/i, '')}_responses_report.pdf`,
+    recipient: CSV_RESPONSE_REPORT_RECIPIENT,
+    acceptedCount: acceptedRecords.length,
+    rejectedCount: rejectedDetails.length,
+    generatedAt: generatedAt.toISOString(),
+  };
+}
+
+async function blobToBase64(blob: Blob) {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = '';
+  const chunkSize = 0x8000;
+
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+
+  return btoa(binary);
+}
+
+export async function downloadCsvResponseReport(results: AnalysisResponse) {
+  return buildCsvResponseReport(results);
+}
+
+export async function emailCsvResponseReport(results: AnalysisResponse, recipient = CSV_RESPONSE_REPORT_RECIPIENT) {
+  const report = await buildCsvResponseReport(results);
+  const pdfBase64 = await blobToBase64(report.blob);
+  const { data, error } = await supabase.functions.invoke('send-csv-report', {
+    body: {
+      fileName: report.fileName,
+      sourceFileName: results.file_name,
+      acceptedCount: report.acceptedCount,
+      rejectedCount: report.rejectedCount,
+      generatedAt: report.generatedAt,
+      pdfBase64,
+    },
+  });
+
+  if (error) {
+    const message = error.message || '';
+    if (message.toLowerCase().includes('failed to send a request')) {
+      fail('The email function is not reachable yet. Deploy the `send-csv-report` Supabase Edge Function and make sure `verify_jwt = false` is set in `supabase/config.toml`.');
+    }
+    fail(message || 'Failed to email the CSV response report.');
+  }
+  return {
+    recipient,
+    ...(data as { message?: string; recipient?: string }),
+  };
+}
+
+export async function downloadSessionResults(results: AnalysisResponse) {
+  const rowsById = await loadSessionSourceRows(results.session_id);
   const records = [...results.anomalies, ...results.clear_records];
   const selectedIds = records
     .filter(record => (results.analysis_mode === 'csv' ? record.decision_status === 'declined' : record.decision_status === 'approved'))
@@ -1160,7 +1660,7 @@ export async function searchHistory(query: string): Promise<SearchRecord[]> {
   const data = await runQuery(
     supabase
       .from('history_records')
-      .select('account_number, customer_name1, ec_number, customer_no, amount_financed, book_date')
+      .select('account_number, customer_name1, ec_number, customer_no, amount_financed, book_date, row_data')
       .or(`ec_number.ilike.${pattern},customer_no.ilike.${pattern},customer_name1.ilike.${pattern}`)
       .order('book_date', { ascending: false })
       .limit(100),
@@ -1173,6 +1673,7 @@ export async function searchHistory(query: string): Promise<SearchRecord[]> {
     EC_NUMBER: (row as HistoryRecordRow).ec_number ?? null,
     CUSTOMER_NO: (row as HistoryRecordRow).customer_no ?? null,
     AMOUNT_FINANCED: (row as HistoryRecordRow).amount_financed ?? null,
+    CURRENCY: extractCurrency(((row as HistoryRecordRow).row_data ?? {}) as SourceRow),
     BOOK_DATE: (row as HistoryRecordRow).book_date ?? null,
   }));
 }

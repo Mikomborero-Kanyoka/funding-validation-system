@@ -14,7 +14,9 @@ import {
 } from 'lucide-react';
 import {
   analyzeUpload,
+  downloadCsvResponseReport,
   downloadSessionResults,
+  emailCsvResponseReport,
   getActivitySessionDetail,
   getActivitySessions,
   getApprovalLedger,
@@ -35,6 +37,7 @@ type SearchRecord = {
   EC_NUMBER?: string | null;
   CUSTOMER_NO?: string | number | null;
   AMOUNT_FINANCED?: number | null;
+  CURRENCY?: string | null;
   BOOK_DATE?: string | null;
 };
 
@@ -47,6 +50,7 @@ type ReviewRecord = {
   ec_number?: string | number | null;
   customer_no?: string | number | null;
   amount?: number | null;
+  currency?: string | null;
   application_book_date?: string | null;
   category: 'anomaly' | 'clear';
   reason: string;
@@ -146,11 +150,31 @@ type ApprovalLedgerResponse = {
   records: ApprovalLedgerRecord[];
 };
 
-function formatCurrency(value: number | string | null | undefined) {
+function normalizeCurrencyCode(value: unknown) {
+  if (value === null || value === undefined || value === '') return null;
+  const code = String(value).trim().toUpperCase();
+  return code || null;
+}
+
+function getCurrencyCode(row: Record<string, unknown> | null | undefined) {
+  if (!row) return null;
+  return normalizeCurrencyCode(row.CURRENCY ?? row.currency ?? row.Currency ?? row.ccy ?? row.CCY);
+}
+
+function getRecordCurrency(record: ReviewRecord) {
+  const recordCurrency = normalizeCurrencyCode(record.currency);
+  if (recordCurrency) return recordCurrency;
+  if ('source_row' in record) return getCurrencyCode((record as ActivityRecord).source_row as Record<string, unknown>);
+  return null;
+}
+
+function formatCurrency(value: number | string | null | undefined, currency?: string | null) {
   if (value === null || value === undefined || value === '') return 'N/A';
   const n = typeof value === 'number' ? value : Number(value);
   if (!Number.isFinite(n)) return String(value);
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(n);
+  const amount = new Intl.NumberFormat('en-US', { maximumFractionDigits: 2, minimumFractionDigits: 2 }).format(n);
+  const currencyCode = normalizeCurrencyCode(currency);
+  return currencyCode ? `${currencyCode} ${amount}` : amount;
 }
 
 function formatDate(value: string | null | undefined) {
@@ -428,6 +452,21 @@ function RowActions({
 
 // ── Expanded panel ────────────────────────────────────────────────────────────
 function ExpandedPanel({ record, isCsv }: { record: ReviewRecord; isCsv: boolean }) {
+  if (!isCsv && record.category === 'anomaly') {
+    const reasons = record.anomaly_reasons?.length ? record.anomaly_reasons : [record.reason];
+    return (
+      <div className="px-4 py-3 bg-slate-50 border-t border-slate-200">
+        <div className="space-y-1">
+          {reasons.map((reason, index) => (
+            <div key={`${record.application_id}-${index}`} className="text-xs font-medium text-amber-800">
+              {reason}
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="px-4 pb-4 pt-3 bg-slate-50 border-t border-slate-200">
       <div className="grid grid-cols-3 gap-2 mb-3">
@@ -468,7 +507,7 @@ function ExpandedPanel({ record, isCsv }: { record: ReviewRecord; isCsv: boolean
               ['Name', record.applicant_name || 'N/A'],
               ['EC number', String(record.ec_number || 'N/A')],
               ['Customer no.', String(record.customer_no || 'N/A')],
-              ['Amount', formatCurrency(record.amount)],
+              ['Amount', formatCurrency(record.amount, getRecordCurrency(record))],
             ].map(([label, val]) => (
               <div key={label} className="flex justify-between text-xs py-1 border-b border-slate-100 last:border-0">
                 <span className="text-slate-500">{label}</span>
@@ -491,7 +530,7 @@ function ExpandedPanel({ record, isCsv }: { record: ReviewRecord; isCsv: boolean
                     {m.EC_NUMBER || 'N/A'} · Cust: {m.CUSTOMER_NO || 'N/A'}
                   </div>
                   <div className="text-[11px] text-slate-500">
-                    Booked: {formatDate(m.BOOK_DATE)} · {formatCurrency(m.AMOUNT_FINANCED)}
+                    Booked: {formatDate(m.BOOK_DATE)} · {formatCurrency(m.AMOUNT_FINANCED, getCurrencyCode(m as Record<string, unknown>))}
                   </div>
                 </div>
               ))}
@@ -539,7 +578,7 @@ function RecordRow({
         <div className="px-2 text-xs font-semibold text-slate-800 truncate">{getRecordLabel(record)}</div>
         <div className="px-2 text-[11px] text-slate-400 truncate">{String(getPrimaryIdentifier(record))} · {record.row}</div>
         <div className="px-2"><StatusBadge record={record} isCsv={isCsv} /></div>
-        <div className="px-2 text-xs font-semibold text-slate-800 text-right">{formatCurrency(record.amount)}</div>
+        <div className="px-2 text-xs font-semibold text-slate-800 text-right">{formatCurrency(record.amount, getRecordCurrency(record))}</div>
         <div className="px-2 text-[11px] text-slate-400 text-right">{formatDate(record.application_book_date || record.reference_date).slice(5)}</div>
         <div className="px-2 flex items-center justify-end gap-1" onClick={e => e.stopPropagation()}>
           <RowActions record={record} isCsv={isCsv} loading={loading} onDecide={onDecide} />
@@ -573,6 +612,7 @@ function UploadView({
   const [riskFilter, setRiskFilter] = useState<RiskFilter>('all');
   const [approvalFilter, setApprovalFilter] = useState<ApprovalFilter>('all');
   const [downloadLoading, setDownloadLoading] = useState(false);
+  const [emailLoading, setEmailLoading] = useState(false);
   const [search, setSearch] = useState('');
 
   const isCsv = results?.analysis_mode === 'csv';
@@ -634,7 +674,9 @@ function UploadView({
     if (!results) return;
     setDownloadLoading(true);
     try {
-      const { blob, fileName } = await downloadSessionResults(results);
+      const { blob, fileName } = isCsv
+        ? await downloadCsvResponseReport(results)
+        : await downloadSessionResults(results);
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url; link.download = fileName;
@@ -647,6 +689,19 @@ function UploadView({
     }
   };
 
+  const handleEmailReport = async () => {
+    if (!results || !isCsv) return;
+    setEmailLoading(true);
+    try {
+      const response = await emailCsvResponseReport(results);
+      alert(response.message || `Report emailed to ${response.recipient || 'aiqkanyoka@gmail.com'}.`);
+    } catch (error: unknown) {
+      alert(error instanceof Error ? error.message : 'Failed to email the report.');
+    } finally {
+      setEmailLoading(false);
+    }
+  };
+
   return (
     <div className="flex flex-col h-full">
       {/* Top bar */}
@@ -655,15 +710,25 @@ function UploadView({
           <div className="text-sm font-semibold text-slate-900">Review queue</div>
           {results && <div className="text-xs text-slate-400">{results.file_name}</div>}
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 flex-wrap justify-end">
           {results && (
             <button
               onClick={handleDownload}
-              disabled={(isCsv ? rejectedRecords.length === 0 : approvedRecords.length === 0) || downloadLoading}
+              disabled={(!isCsv && approvedRecords.length === 0) || downloadLoading}
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs border border-slate-200 rounded-lg bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {downloadLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
-              {isCsv ? 'Download rejected' : 'Download approved'}
+              {isCsv ? 'Download PDF report' : 'Download approved'}
+            </button>
+          )}
+          {results && isCsv && (
+            <button
+              onClick={handleEmailReport}
+              disabled={emailLoading}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {emailLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileText className="w-3.5 h-3.5" />}
+              Email report
             </button>
           )}
           <button
@@ -906,7 +971,7 @@ function HistoryView() {
                       <td className="px-4 py-2 text-xs font-medium text-slate-800 truncate">{r.CUSTOMER_NAME1}</td>
                       <td className="px-4 py-2 text-xs text-slate-600">{r.EC_NUMBER || 'N/A'}</td>
                       <td className="px-4 py-2 text-xs text-slate-500">{r.CUSTOMER_NO || 'N/A'}</td>
-                      <td className="px-4 py-2 text-xs font-semibold text-slate-800">{formatCurrency(r.AMOUNT_FINANCED)}</td>
+                      <td className="px-4 py-2 text-xs font-semibold text-slate-800">{formatCurrency(r.AMOUNT_FINANCED, getCurrencyCode(r as Record<string, unknown>))}</td>
                       <td className="px-4 py-2 text-xs text-slate-500">{formatDate(r.BOOK_DATE)}</td>
                     </tr>
                   ))}
@@ -1180,7 +1245,7 @@ function ActivityLogView() {
                             <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${getDecisionPillClass(record.decision_status)}`}>
                               {formatDecisionLabel(record.decision_status)}
                             </span>
-                            <span className="text-xs font-semibold text-slate-800">{formatCurrency(record.amount)}</span>
+                            <span className="text-xs font-semibold text-slate-800">{formatCurrency(record.amount, getRecordCurrency(record))}</span>
                           </div>
                         </div>
                       </summary>
@@ -1440,7 +1505,7 @@ function ExportView({ results }: { results: AnalysisResponse | null }) {
                   <tr key={i} className="hover:bg-slate-50">
                     <td className="px-5 py-2.5 text-xs font-semibold text-slate-800">{getRecordLabel(r)}</td>
                     <td className="px-5 py-2.5 text-xs text-slate-500 font-mono">{String(getPrimaryIdentifier(r))}</td>
-                    <td className="px-5 py-2.5 text-xs font-bold text-emerald-700 text-right">{formatCurrency(r.amount)}</td>
+                    <td className="px-5 py-2.5 text-xs font-bold text-emerald-700 text-right">{formatCurrency(r.amount, getRecordCurrency(r))}</td>
                     <td className="px-5 py-2.5 text-right">
                       <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-bold uppercase ${r.category === 'anomaly' ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700'}`}>
                         {r.category === 'anomaly' ? 'Override' : 'Standard'}
@@ -1668,7 +1733,7 @@ function ApprovalLedgerView() {
                         <div className="text-xs font-medium text-slate-700">{record.file_name || 'Unknown upload'}</div>
                         <div className="text-[10px] text-slate-400">{formatUploadMode(record.analysis_mode || '')}</div>
                       </td>
-                      <td className="px-5 py-2.5 text-xs font-bold text-emerald-700 text-right">{formatCurrency(record.amount)}</td>
+                      <td className="px-5 py-2.5 text-xs font-bold text-emerald-700 text-right">{formatCurrency(record.amount, getRecordCurrency(record))}</td>
                       <td className="px-5 py-2.5 text-right">
                         <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-bold uppercase ${record.category === 'anomaly' ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700'}`}>
                           {record.category === 'anomaly' ? 'Override' : 'Standard'}
